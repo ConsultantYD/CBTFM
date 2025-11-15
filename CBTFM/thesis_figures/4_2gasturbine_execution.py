@@ -1,8 +1,7 @@
 """
 Figure 4.2 — Gas Turbine Execution (Single Event)
 
-Copy of Example 3 (single-event deep dive) adapted to execute a specific
-desired reduction profile over one day. Plots three rows:
+Plots three rows:
  1) Original (baseline) vs New (achieved) load
  2) Stacked contributions by agent type within the event window
  3) Error between desired reduction curve and executed reduction
@@ -37,9 +36,9 @@ pio.renderers.default = os.environ.get("PLOTLY_RENDERER", "browser")
 USE_HEURISTIC = True
 
 # Agent counts
-N_HVAC = 5000
-N_STORAGE = 3000
-N_CI = 3000
+N_HVAC = 10000
+N_STORAGE = 6000
+N_CI = 2000
 
 N_TIMESTEPS = 24
 
@@ -50,7 +49,7 @@ END = 23
 # Reproducibility
 SEED = 20251102
 
-# Outdoor temperature bias (keeps HVAC demand active similar to Example 3)
+# Outdoor temperature bias
 OUTDOOR_TEMP_SHIFT_C = -20.0
 
 
@@ -73,8 +72,18 @@ def _rng_reset(seed: int = SEED) -> random.Random:
 
 
 def build_env(T: int) -> dict:
-    prices = 0.10 + 0.15 * 0.5 * (1 - np.cos(np.linspace(0, 2 * np.pi, T)))
-    prices[int(0.7 * T) : min(T, int(0.7 * T) + 3)] *= 1.5
+    # Start from a smooth diurnal price curve
+    base_prices = 0.10 + 0.15 * 0.5 * (1 - np.cos(np.linspace(0, 2 * np.pi, T)))
+    prices = base_prices.copy()
+
+    # Make afternoon hours cheaper to encourage storage charging in the baseline.
+    # For T=24 this roughly corresponds to 12:00–19:00.
+    afternoon_start = int(0.5 * T)
+    afternoon_end = int(0.8 * T)
+    afternoon_start = max(0, min(T - 1, afternoon_start))
+    afternoon_end = max(afternoon_start, min(T - 1, afternoon_end))
+    prices[afternoon_start : afternoon_end + 1] *= 0.6
+
     outdoor = 10 + 10 * np.sin(np.linspace(0, 2 * np.pi, T) - np.pi / 1.6)
     outdoor = outdoor + float(OUTDOOR_TEMP_SHIFT_C)
     return {
@@ -361,6 +370,10 @@ def synthesize_hvac_window_bids(
 def build_desired_reduction_series() -> np.ndarray:
     """Desired reduction (kW) per hour for 0..23.
 
+    The values below are provided in MW as the flexibility
+    target profile; we convert them to kW for use in the
+    system model.
+
     Provided values (interpreted as reductions, not absolute load):
     00:00–13:00 => 0.0 kW
     14:00 => 43.759...
@@ -411,18 +424,30 @@ def compute_target_from_reduction(
 
 def render_figure(
     baseline: np.ndarray,
+    target: np.ndarray,
     achieved: np.ndarray,
     dispatched: List[Dict],
-    desired_reduction: np.ndarray,
     s: int,
     e: int,
 ):
     T = len(baseline)
     x = list(range(T))
 
-    # Executed reduction series (positive = reduction)
-    executed_reduction = np.maximum(0.0, baseline - achieved)
-    err = desired_reduction - executed_reduction
+    baseline_arr = np.asarray(baseline, dtype=float)
+    achieved_arr = np.asarray(achieved, dtype=float)
+    target_arr = np.asarray(target, dtype=float)
+
+    # Load error series in percent, measured relative to the
+    # requested reduction (baseline - target). A value of:
+    #   0%  => achieved == target (perfect tracking)
+    # 100% => achieved == baseline (no reduction delivered)
+    tiny = 1e-6
+    requested_reduction = baseline_arr - target_arr
+    diff = achieved_arr - target_arr
+    err_pct = np.zeros_like(diff)
+    valid = requested_reduction > tiny
+    err_pct[valid] = 100.0 * diff[valid] / requested_reduction[valid]
+    err = err_pct
 
     # Build figure: 3 rows
     fig = make_subplots(
@@ -433,7 +458,7 @@ def render_figure(
         row_heights=[0.5, 0.25, 0.25],
     )
 
-    # Row 1 — Baseline vs Achieved (no target line per request)
+    # Row 1 — Baseline vs Achieved vs Target
     fig.add_trace(
         go.Scatter(
             x=x,
@@ -451,6 +476,21 @@ def render_figure(
             y=achieved,
             name="New Load",
             line=dict(color="black", width=3),
+        ),
+        row=1,
+        col=1,
+    )
+    # Show target load (baseline minus flex target) in gold, within event window
+    target_mask = [None] * T
+    s0_top, e0_top = max(0, s), min(T - 1, e)
+    for i in range(s0_top, e0_top + 1):
+        target_mask[i] = float(target_arr[i])
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=target_mask,
+            name="Target Load",
+            line=dict(color="#DAA520", width=3),
         ),
         row=1,
         col=1,
@@ -497,7 +537,7 @@ def render_figure(
                 col=1,
             )
 
-    # Row 3 — Error between desired and executed reduction (window only)
+    # Row 3 — Error between target and achieved load (window only, percent)
     y_err = [None] * T
     s0, e0 = max(0, s), min(T - 1, e)
     for i in range(s0, e0 + 1):
@@ -506,7 +546,7 @@ def render_figure(
         go.Scatter(
             x=x,
             y=y_err,
-            name="Reduction Error (Desired - Executed)",
+            name="Load Error (% of Target)",
             line=dict(color="#B22222", width=2),
         ),
         row=3,
@@ -532,7 +572,7 @@ def render_figure(
     fig.update_yaxes(title_text="System Load (kW)", row=1, col=1)
     fig.update_yaxes(title_text="Contrib. (kW)", row=2, col=1, nticks=3)
     fig.update_yaxes(
-        title_text="Error (kW)", row=3, col=1, nticks=5, showline=True, gridwidth=1
+        title_text="Error (%)", row=3, col=1, nticks=5, showline=True, gridwidth=1
     )
     fig.update_xaxes(title_text="Hour", row=3, col=1)
 
@@ -587,9 +627,9 @@ def main():
 
     render_figure(
         baseline=baseline,
+        target=target,
         achieved=achieved,
         dispatched=dispatched,
-        desired_reduction=desired_reduction,
         s=START,
         e=END,
     )
